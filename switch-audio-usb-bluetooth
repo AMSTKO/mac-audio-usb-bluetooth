@@ -1,0 +1,565 @@
+#!/usr/bin/env swift
+
+import CoreAudio
+import Darwin
+import Dispatch
+import Foundation
+
+struct AudioDevice {
+    let id: AudioDeviceID
+    let name: String
+    let uid: String
+    let transportType: UInt32?
+    let inputChannels: Int
+    let outputChannels: Int
+
+    var hasInput: Bool { inputChannels > 0 }
+    var hasOutput: Bool { outputChannels > 0 }
+    var isUSBInput: Bool { hasInput && transportType == kAudioDeviceTransportTypeUSB }
+    var isBluetoothOutput: Bool {
+        guard hasOutput, let transportType else { return false }
+        return transportType == kAudioDeviceTransportTypeBluetooth
+            || transportType == kAudioDeviceTransportTypeBluetoothLE
+    }
+}
+
+enum ScriptError: Error, CustomStringConvertible {
+    case message(String)
+    case coreAudio(String, OSStatus)
+
+    var description: String {
+        switch self {
+        case .message(let message):
+            return message
+        case .coreAudio(let operation, let status):
+            return "\(operation) failed: \(statusDescription(status))"
+        }
+    }
+}
+
+struct Options {
+    var listOnly = false
+    var watch = false
+    var inputName: String?
+    var outputName: String?
+}
+
+enum ApplyResult {
+    case ready(input: AudioDevice, output: AudioDevice, changed: Bool)
+    case waiting(String)
+}
+
+let systemObject = AudioObjectID(kAudioObjectSystemObject)
+
+func writeError(_ message: String) {
+    FileHandle.standardError.write(Data((message + "\n").utf8))
+}
+
+func fail(_ message: String) -> Never {
+    writeError("Error: \(message)")
+    exit(1)
+}
+
+func usage() {
+    print("""
+    Usage:
+      ./switch-audio-usb-bluetooth [--input-name NAME] [--output-name NAME]
+      ./switch-audio-usb-bluetooth --watch [--input-name NAME] [--output-name NAME]
+      ./switch-audio-usb-bluetooth --list
+
+    Behavior:
+      Selects the first available USB input device and the first connected
+      Bluetooth/Bluetooth LE output device. If no Bluetooth output is visible,
+      the normal mode exits without changing audio devices. In --watch mode,
+      the script waits and reapplies the selection when CoreAudio reports a
+      device/default-output change.
+    """)
+}
+
+func statusDescription(_ status: OSStatus) -> String {
+    let code = UInt32(bitPattern: status)
+    let bytes = [
+        UInt8((code >> 24) & 0xff),
+        UInt8((code >> 16) & 0xff),
+        UInt8((code >> 8) & 0xff),
+        UInt8(code & 0xff),
+    ]
+
+    if bytes.allSatisfy({ $0 >= 32 && $0 <= 126 }),
+       let fourCC = String(bytes: bytes, encoding: .macOSRoman) {
+        return "'\(fourCC)' (\(status))"
+    }
+
+    return "\(status)"
+}
+
+func fourCC(_ value: UInt32) -> String {
+    let bytes = [
+        UInt8((value >> 24) & 0xff),
+        UInt8((value >> 16) & 0xff),
+        UInt8((value >> 8) & 0xff),
+        UInt8(value & 0xff),
+    ]
+
+    return String(bytes: bytes, encoding: .macOSRoman)?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        ?? "\(value)"
+}
+
+func transportLabel(_ value: UInt32?) -> String {
+    guard let value else { return "unknown" }
+
+    switch value {
+    case kAudioDeviceTransportTypeUSB:
+        return "USB"
+    case kAudioDeviceTransportTypeBluetooth:
+        return "Bluetooth"
+    case kAudioDeviceTransportTypeBluetoothLE:
+        return "Bluetooth LE"
+    default:
+        return fourCC(value)
+    }
+}
+
+func parseOptions(_ arguments: [String]) throws -> Options {
+    var options = Options()
+    var index = 0
+
+    while index < arguments.count {
+        let argument = arguments[index]
+
+        switch argument {
+        case "--help", "-h":
+            usage()
+            exit(0)
+        case "--list":
+            options.listOnly = true
+        case "--watch":
+            options.watch = true
+        case "--input-name":
+            index += 1
+            guard index < arguments.count else {
+                throw ScriptError.message("--input-name requires a value")
+            }
+            options.inputName = arguments[index]
+        case "--output-name":
+            index += 1
+            guard index < arguments.count else {
+                throw ScriptError.message("--output-name requires a value")
+            }
+            options.outputName = arguments[index]
+        default:
+            throw ScriptError.message("Unknown argument: \(argument)")
+        }
+
+        index += 1
+    }
+
+    return options
+}
+
+func stringProperty(_ objectID: AudioObjectID, _ selector: AudioObjectPropertySelector) -> String {
+    var address = AudioObjectPropertyAddress(
+        mSelector: selector,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    var size = UInt32(MemoryLayout<CFString?>.size)
+    var value: CFString?
+
+    let status = withUnsafeMutablePointer(to: &value) { pointer in
+        AudioObjectGetPropertyData(objectID, &address, 0, nil, &size, pointer)
+    }
+
+    guard status == noErr else { return "" }
+    return value as String? ?? ""
+}
+
+func uint32Property(_ objectID: AudioObjectID, _ selector: AudioObjectPropertySelector) -> UInt32? {
+    var address = AudioObjectPropertyAddress(
+        mSelector: selector,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    var size = UInt32(MemoryLayout<UInt32>.size)
+    var value: UInt32 = 0
+
+    let status = AudioObjectGetPropertyData(objectID, &address, 0, nil, &size, &value)
+    return status == noErr ? value : nil
+}
+
+func channelCount(_ deviceID: AudioDeviceID, scope: AudioObjectPropertyScope) -> Int {
+    var address = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyStreamConfiguration,
+        mScope: scope,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    var size: UInt32 = 0
+
+    guard AudioObjectGetPropertyDataSize(deviceID, &address, 0, nil, &size) == noErr,
+          size > 0 else {
+        return 0
+    }
+
+    let bufferList = UnsafeMutableRawPointer.allocate(
+        byteCount: Int(size),
+        alignment: MemoryLayout<AudioBufferList>.alignment
+    )
+    defer { bufferList.deallocate() }
+
+    guard AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, bufferList) == noErr else {
+        return 0
+    }
+
+    let audioBuffers = UnsafeMutableAudioBufferListPointer(
+        bufferList.assumingMemoryBound(to: AudioBufferList.self)
+    )
+
+    return audioBuffers.reduce(0) { total, buffer in
+        total + Int(buffer.mNumberChannels)
+    }
+}
+
+func readDevices() throws -> [AudioDevice] {
+    var address = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDevices,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    var size: UInt32 = 0
+
+    var status = AudioObjectGetPropertyDataSize(systemObject, &address, 0, nil, &size)
+    guard status == noErr else {
+        throw ScriptError.coreAudio("Reading audio device list size", status)
+    }
+
+    let count = Int(size) / MemoryLayout<AudioDeviceID>.size
+    var ids = [AudioDeviceID](repeating: 0, count: count)
+
+    status = AudioObjectGetPropertyData(systemObject, &address, 0, nil, &size, &ids)
+    guard status == noErr else {
+        throw ScriptError.coreAudio("Reading audio device list", status)
+    }
+
+    return ids.map { id in
+        AudioDevice(
+            id: id,
+            name: stringProperty(id, kAudioObjectPropertyName).isEmpty
+                ? "Audio Device \(id)"
+                : stringProperty(id, kAudioObjectPropertyName),
+            uid: stringProperty(id, kAudioDevicePropertyDeviceUID),
+            transportType: uint32Property(id, kAudioDevicePropertyTransportType),
+            inputChannels: channelCount(id, scope: kAudioDevicePropertyScopeInput),
+            outputChannels: channelCount(id, scope: kAudioDevicePropertyScopeOutput)
+        )
+    }
+}
+
+func sortedDevices(_ devices: [AudioDevice]) -> [AudioDevice] {
+    devices.sorted {
+        if $0.name == $1.name { return $0.id < $1.id }
+        return $0.name.localizedStandardCompare($1.name) == .orderedAscending
+    }
+}
+
+func describe(_ device: AudioDevice) -> String {
+    let input = device.inputChannels > 0 ? "\(device.inputChannels)ch" : "-"
+    let output = device.outputChannels > 0 ? "\(device.outputChannels)ch" : "-"
+    return "id=\(device.id) name=\"\(device.name)\" transport=\(transportLabel(device.transportType)) input=\(input) output=\(output)"
+}
+
+func deviceList(_ devices: [AudioDevice]) -> String {
+    sortedDevices(devices).map { "- \(describe($0))" }.joined(separator: "\n")
+}
+
+func printDeviceList(_ devices: [AudioDevice]) {
+    print("Audio devices:")
+    print(deviceList(devices))
+
+    let usbInputs = devices.filter(\.isUSBInput)
+    let bluetoothOutputs = devices.filter(\.isBluetoothOutput)
+
+    print("")
+    print("USB input candidates:")
+    print(usbInputs.isEmpty ? "- none" : deviceList(usbInputs))
+    print("")
+    print("Bluetooth output candidates:")
+    print(bluetoothOutputs.isEmpty ? "- none" : deviceList(bluetoothOutputs))
+}
+
+func chooseDevice(
+    from devices: [AudioDevice],
+    requestedName: String?,
+    kind: String,
+    emptyMessage: String
+) throws -> AudioDevice {
+    let candidates = sortedDevices(devices)
+
+    guard !candidates.isEmpty else {
+        throw ScriptError.message(emptyMessage)
+    }
+
+    guard let requestedName else {
+        return candidates[0]
+    }
+
+    if let exact = candidates.first(where: {
+        $0.name.caseInsensitiveCompare(requestedName) == .orderedSame
+            || $0.uid.caseInsensitiveCompare(requestedName) == .orderedSame
+    }) {
+        return exact
+    }
+
+    let query = requestedName.lowercased()
+    let matches = candidates.filter {
+        $0.name.lowercased().contains(query) || $0.uid.lowercased().contains(query)
+    }
+
+    if matches.count == 1 {
+        return matches[0]
+    }
+
+    if matches.count > 1 {
+        throw ScriptError.message("""
+        Multiple \(kind) devices match "\(requestedName)":
+        \(deviceList(matches))
+        Use a more specific --\(kind)-name value.
+        """)
+    }
+
+    throw ScriptError.message("""
+    No \(kind) device matches "\(requestedName)".
+    Available \(kind) candidates:
+    \(deviceList(candidates))
+    """)
+}
+
+func defaultDevice(_ selector: AudioObjectPropertySelector) -> AudioDeviceID? {
+    var address = AudioObjectPropertyAddress(
+        mSelector: selector,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+    var value = AudioDeviceID(0)
+
+    let status = AudioObjectGetPropertyData(systemObject, &address, 0, nil, &size, &value)
+    return status == noErr ? value : nil
+}
+
+func setDefaultDevice(_ selector: AudioObjectPropertySelector, to deviceID: AudioDeviceID, label: String) throws {
+    var address = AudioObjectPropertyAddress(
+        mSelector: selector,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    var value = deviceID
+
+    let status = AudioObjectSetPropertyData(
+        systemObject,
+        &address,
+        0,
+        nil,
+        UInt32(MemoryLayout<AudioDeviceID>.size),
+        &value
+    )
+
+    guard status == noErr else {
+        throw ScriptError.coreAudio("Setting \(label)", status)
+    }
+}
+
+func rollback(
+    input: AudioDeviceID?,
+    output: AudioDeviceID?,
+    systemOutput: AudioDeviceID?
+) {
+    if let input {
+        try? setDefaultDevice(kAudioHardwarePropertyDefaultInputDevice, to: input, label: "previous input")
+    }
+    if let output {
+        try? setDefaultDevice(kAudioHardwarePropertyDefaultOutputDevice, to: output, label: "previous output")
+    }
+    if let systemOutput {
+        try? setDefaultDevice(kAudioHardwarePropertyDefaultSystemOutputDevice, to: systemOutput, label: "previous system output")
+    }
+}
+
+func selectDevices(_ devices: [AudioDevice], options: Options) throws -> (AudioDevice, AudioDevice) {
+    let inputDevice = try chooseDevice(
+        from: devices.filter(\.isUSBInput),
+        requestedName: options.inputName,
+        kind: "input",
+        emptyMessage: """
+        No USB input device is available.
+        Connect your USB microphone or audio interface and run the script again.
+        """
+    )
+
+    let outputDevice = try chooseDevice(
+        from: devices.filter(\.isBluetoothOutput),
+        requestedName: options.outputName,
+        kind: "output",
+        emptyMessage: """
+        No Bluetooth output device is connected or visible.
+        Connect your Bluetooth speaker/headphones in macOS, then run the script again.
+        """
+    )
+
+    return (inputDevice, outputDevice)
+}
+
+func applyAudioSelection(options: Options) throws -> ApplyResult {
+    let devices = try readDevices()
+
+    do {
+        let (inputDevice, outputDevice) = try selectDevices(devices, options: options)
+        let previousInput = defaultDevice(kAudioHardwarePropertyDefaultInputDevice)
+        let previousOutput = defaultDevice(kAudioHardwarePropertyDefaultOutputDevice)
+        let previousSystemOutput = defaultDevice(kAudioHardwarePropertyDefaultSystemOutputDevice)
+
+        let inputChanged = previousInput != inputDevice.id
+        let outputChanged = previousOutput != outputDevice.id
+        let systemOutputChanged = previousSystemOutput != outputDevice.id
+
+        guard inputChanged || outputChanged || systemOutputChanged else {
+            return .ready(input: inputDevice, output: outputDevice, changed: false)
+        }
+
+        do {
+            if inputChanged {
+                try setDefaultDevice(kAudioHardwarePropertyDefaultInputDevice, to: inputDevice.id, label: "default input")
+            }
+            if outputChanged {
+                try setDefaultDevice(kAudioHardwarePropertyDefaultOutputDevice, to: outputDevice.id, label: "default output")
+            }
+            if systemOutputChanged {
+                try setDefaultDevice(kAudioHardwarePropertyDefaultSystemOutputDevice, to: outputDevice.id, label: "system output")
+            }
+        } catch {
+            rollback(input: previousInput, output: previousOutput, systemOutput: previousSystemOutput)
+            throw error
+        }
+
+        return .ready(input: inputDevice, output: outputDevice, changed: true)
+    } catch let error as ScriptError {
+        if options.watch {
+            return .waiting(error.description)
+        }
+        throw error
+    }
+}
+
+func logLine(_ message: String) {
+    let formatter = DateFormatter()
+    formatter.dateFormat = "HH:mm:ss"
+    print("[\(formatter.string(from: Date()))] \(message)")
+    fflush(stdout)
+}
+
+final class AudioWatcher {
+    private let options: Options
+    private let queue = DispatchQueue(label: "switch-audio-usb-bluetooth.watch")
+    private var pendingWorkItem: DispatchWorkItem?
+    private var lastStateKey = ""
+
+    init(options: Options) {
+        self.options = options
+    }
+
+    func start() throws -> Never {
+        try addSystemListener(kAudioHardwarePropertyDevices)
+        try addSystemListener(kAudioHardwarePropertyDefaultInputDevice)
+        try addSystemListener(kAudioHardwarePropertyDefaultOutputDevice)
+        try addSystemListener(kAudioHardwarePropertyDefaultSystemOutputDevice)
+
+        logLine("Watching audio changes. Press Ctrl-C to stop.")
+        scheduleApply(reason: "startup", delay: 0)
+        dispatchMain()
+    }
+
+    private func addSystemListener(_ selector: AudioObjectPropertySelector) throws {
+        var address = AudioObjectPropertyAddress(
+            mSelector: selector,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+
+        let status = AudioObjectAddPropertyListenerBlock(systemObject, &address, queue) { [weak self] _, _ in
+            self?.scheduleApply(reason: "audio change", delay: 0.25)
+        }
+
+        guard status == noErr else {
+            throw ScriptError.coreAudio("Adding CoreAudio listener", status)
+        }
+    }
+
+    private func scheduleApply(reason: String, delay: TimeInterval) {
+        queue.async {
+            self.pendingWorkItem?.cancel()
+
+            let workItem = DispatchWorkItem { [weak self] in
+                self?.apply(reason: reason)
+            }
+
+            self.pendingWorkItem = workItem
+            self.queue.asyncAfter(deadline: .now() + delay, execute: workItem)
+        }
+    }
+
+    private func apply(reason: String) {
+        do {
+            let result = try applyAudioSelection(options: options)
+
+            switch result {
+            case .ready(let input, let output, let changed):
+                let stateKey = "ready:\(input.id):\(output.id)"
+                if changed {
+                    logLine("Applied: input USB = \(input.name), output Bluetooth = \(output.name)")
+                } else if stateKey != lastStateKey {
+                    logLine("Active: input USB = \(input.name), output Bluetooth = \(output.name)")
+                }
+                lastStateKey = stateKey
+
+            case .waiting(let message):
+                let stateKey = "waiting:\(message)"
+                if stateKey != lastStateKey {
+                    logLine("Waiting: \(message.replacingOccurrences(of: "\n", with: " "))")
+                }
+                lastStateKey = stateKey
+            }
+        } catch {
+            let stateKey = "error:\(error)"
+            if stateKey != lastStateKey {
+                logLine("Error: \(error)")
+            }
+            lastStateKey = stateKey
+        }
+    }
+}
+
+do {
+    let options = try parseOptions(Array(CommandLine.arguments.dropFirst()))
+    let devices = try readDevices()
+
+    if options.listOnly {
+        printDeviceList(devices)
+        exit(0)
+    }
+
+    if options.watch {
+        try AudioWatcher(options: options).start()
+    }
+
+    switch try applyAudioSelection(options: options) {
+    case .ready(let inputDevice, let outputDevice, _):
+        print("Input set to USB: \(inputDevice.name)")
+        print("Output set to Bluetooth: \(outputDevice.name)")
+    case .waiting(let message):
+        throw ScriptError.message(message)
+    }
+} catch let error as ScriptError {
+    fail(error.description)
+} catch {
+    fail(String(describing: error))
+}
