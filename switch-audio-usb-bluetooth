@@ -37,11 +37,17 @@ enum ScriptError: Error, CustomStringConvertible {
     }
 }
 
+enum StartupAction: Equatable {
+    case install
+    case uninstall
+}
+
 struct Options {
     var listOnly = false
     var watch = false
     var inputName: String?
     var outputName: String?
+    var startupAction: StartupAction?
 }
 
 enum ApplyResult {
@@ -50,6 +56,7 @@ enum ApplyResult {
 }
 
 let systemObject = AudioObjectID(kAudioObjectSystemObject)
+let launchAgentLabel = "com.local.switch-audio-usb-bluetooth"
 
 func writeError(_ message: String) {
     FileHandle.standardError.write(Data((message + "\n").utf8))
@@ -66,13 +73,16 @@ func usage() {
       ./switch-audio-usb-bluetooth [--input-name NAME] [--output-name NAME]
       ./switch-audio-usb-bluetooth --watch [--input-name NAME] [--output-name NAME]
       ./switch-audio-usb-bluetooth --list
+      ./switch-audio-usb-bluetooth --install-startup [--input-name NAME] [--output-name NAME]
+      ./switch-audio-usb-bluetooth --uninstall-startup
 
     Behavior:
       Selects the first available USB input device and the first connected
       Bluetooth/Bluetooth LE output device. If no Bluetooth output is visible,
       the normal mode exits without changing audio devices. In --watch mode,
       the script waits and reapplies the selection when CoreAudio reports a
-      device/default-output change.
+      device/default-output change. The startup command installs a per-user
+      LaunchAgent that runs the script in --watch mode at login.
     """)
 }
 
@@ -136,6 +146,16 @@ func parseOptions(_ arguments: [String]) throws -> Options {
             options.listOnly = true
         case "--watch":
             options.watch = true
+        case "--install-startup":
+            guard options.startupAction == nil else {
+                throw ScriptError.message("Use only one startup command")
+            }
+            options.startupAction = .install
+        case "--uninstall-startup", "--remove-startup":
+            guard options.startupAction == nil else {
+                throw ScriptError.message("Use only one startup command")
+            }
+            options.startupAction = .uninstall
         case "--input-name":
             index += 1
             guard index < arguments.count else {
@@ -155,7 +175,164 @@ func parseOptions(_ arguments: [String]) throws -> Options {
         index += 1
     }
 
+    let modeCount = [options.listOnly, options.watch, options.startupAction != nil].filter { $0 }.count
+    if modeCount > 1 {
+        throw ScriptError.message("Use only one mode: --list, --watch, --install-startup, or --uninstall-startup")
+    }
+
+    if options.startupAction == .uninstall && (options.inputName != nil || options.outputName != nil) {
+        throw ScriptError.message("--input-name and --output-name do not apply to --uninstall-startup")
+    }
+
     return options
+}
+
+func launchDomain() -> String {
+    "gui/\(getuid())"
+}
+
+func launchAgentURL() -> URL {
+    FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/LaunchAgents", isDirectory: true)
+        .appendingPathComponent("\(launchAgentLabel).plist")
+}
+
+func logURL(_ name: String) -> URL {
+    FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Logs", isDirectory: true)
+        .appendingPathComponent(name)
+}
+
+func resolveExecutable(_ name: String) -> URL? {
+    let fileManager = FileManager.default
+    let path = ProcessInfo.processInfo.environment["PATH"] ?? "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+    for directory in path.split(separator: ":") {
+        let candidate = URL(fileURLWithPath: String(directory), isDirectory: true)
+            .appendingPathComponent(name)
+        if fileManager.isExecutableFile(atPath: candidate.path) {
+            return candidate.standardizedFileURL.resolvingSymlinksInPath()
+        }
+    }
+
+    return nil
+}
+
+func scriptURL() throws -> URL {
+    let rawPath = CommandLine.arguments[0]
+    let fileManager = FileManager.default
+
+    if rawPath.contains("/") {
+        let currentDirectory = URL(fileURLWithPath: fileManager.currentDirectoryPath, isDirectory: true)
+        let url = URL(fileURLWithPath: rawPath, relativeTo: currentDirectory)
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+
+        if fileManager.fileExists(atPath: url.path) {
+            return url
+        }
+    } else if let resolved = resolveExecutable(rawPath) {
+        return resolved
+    }
+
+    throw ScriptError.message("Could not resolve the script path. Run this command from the script file or with an absolute path.")
+}
+
+func launchctl(_ arguments: [String], allowFailure: Bool = false) throws -> String {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+    process.arguments = arguments
+
+    let pipe = Pipe()
+    process.standardOutput = pipe
+    process.standardError = pipe
+
+    try process.run()
+    process.waitUntilExit()
+
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    let output = String(data: data, encoding: .utf8)?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        ?? ""
+
+    if process.terminationStatus != 0 && !allowFailure {
+        let command = "launchctl \(arguments.joined(separator: " "))"
+        let details = output.isEmpty ? "exit \(process.terminationStatus)" : output
+        throw ScriptError.message("\(command) failed: \(details)")
+    }
+
+    return output
+}
+
+func startupProgramArguments(script: URL, options: Options) -> [String] {
+    var arguments = ["/usr/bin/swift", script.path, "--watch"]
+
+    if let inputName = options.inputName {
+        arguments.append(contentsOf: ["--input-name", inputName])
+    }
+
+    if let outputName = options.outputName {
+        arguments.append(contentsOf: ["--output-name", outputName])
+    }
+
+    return arguments
+}
+
+func startupPlistData(script: URL, options: Options) throws -> Data {
+    let standardOutPath = logURL("switch-audio-usb-bluetooth.log").path
+    let standardErrorPath = logURL("switch-audio-usb-bluetooth.err.log").path
+
+    let plist: [String: Any] = [
+        "Label": launchAgentLabel,
+        "ProgramArguments": startupProgramArguments(script: script, options: options),
+        "RunAtLoad": true,
+        "KeepAlive": true,
+        "WorkingDirectory": script.deletingLastPathComponent().path,
+        "StandardOutPath": standardOutPath,
+        "StandardErrorPath": standardErrorPath,
+    ]
+
+    return try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+}
+
+func installStartupAgent(options: Options) throws {
+    let fileManager = FileManager.default
+    let plistURL = launchAgentURL()
+    let agentDirectory = plistURL.deletingLastPathComponent()
+    let logDirectory = logURL("switch-audio-usb-bluetooth.log").deletingLastPathComponent()
+    let script = try scriptURL()
+
+    try fileManager.createDirectory(at: agentDirectory, withIntermediateDirectories: true)
+    try fileManager.createDirectory(at: logDirectory, withIntermediateDirectories: true)
+
+    if fileManager.fileExists(atPath: plistURL.path) {
+        _ = try launchctl(["bootout", launchDomain(), plistURL.path], allowFailure: true)
+    }
+
+    try startupPlistData(script: script, options: options).write(to: plistURL, options: .atomic)
+
+    _ = try launchctl(["bootstrap", launchDomain(), plistURL.path])
+    _ = try launchctl(["enable", "\(launchDomain())/\(launchAgentLabel)"], allowFailure: true)
+    _ = try launchctl(["kickstart", "-k", "\(launchDomain())/\(launchAgentLabel)"], allowFailure: true)
+
+    print("Installed startup LaunchAgent: \(plistURL.path)")
+    print("Runs at login: /usr/bin/swift \(script.path) --watch")
+    print("Logs: \(logURL("switch-audio-usb-bluetooth.log").path)")
+}
+
+func uninstallStartupAgent() throws {
+    let fileManager = FileManager.default
+    let plistURL = launchAgentURL()
+
+    _ = try launchctl(["disable", "\(launchDomain())/\(launchAgentLabel)"], allowFailure: true)
+    _ = try launchctl(["bootout", launchDomain(), plistURL.path], allowFailure: true)
+
+    if fileManager.fileExists(atPath: plistURL.path) {
+        try fileManager.removeItem(at: plistURL)
+        print("Removed startup LaunchAgent: \(plistURL.path)")
+    } else {
+        print("No startup LaunchAgent found at: \(plistURL.path)")
+    }
 }
 
 func stringProperty(_ objectID: AudioObjectID, _ selector: AudioObjectPropertySelector) -> String {
@@ -540,9 +717,19 @@ final class AudioWatcher {
 
 do {
     let options = try parseOptions(Array(CommandLine.arguments.dropFirst()))
-    let devices = try readDevices()
+
+    if let startupAction = options.startupAction {
+        switch startupAction {
+        case .install:
+            try installStartupAgent(options: options)
+        case .uninstall:
+            try uninstallStartupAgent()
+        }
+        exit(0)
+    }
 
     if options.listOnly {
+        let devices = try readDevices()
         printDeviceList(devices)
         exit(0)
     }
