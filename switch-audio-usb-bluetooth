@@ -221,9 +221,9 @@ func resolveExecutable(_ name: String) -> URL? {
 func scriptURL() throws -> URL {
     let rawPath = CommandLine.arguments[0]
     let fileManager = FileManager.default
+    let currentDirectory = URL(fileURLWithPath: fileManager.currentDirectoryPath, isDirectory: true)
 
     if rawPath.contains("/") {
-        let currentDirectory = URL(fileURLWithPath: fileManager.currentDirectoryPath, isDirectory: true)
         let url = URL(fileURLWithPath: rawPath, relativeTo: currentDirectory)
             .standardizedFileURL
             .resolvingSymlinksInPath()
@@ -231,7 +231,28 @@ func scriptURL() throws -> URL {
         if fileManager.fileExists(atPath: url.path) {
             return url
         }
-    } else if let resolved = resolveExecutable(rawPath) {
+    }
+
+    if let shellCommand = ProcessInfo.processInfo.environment["_"],
+       shellCommand.contains("/") {
+        let url = URL(fileURLWithPath: shellCommand, relativeTo: currentDirectory)
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+
+        if fileManager.fileExists(atPath: url.path) {
+            return url
+        }
+    }
+
+    let currentDirectoryCandidate = currentDirectory
+        .appendingPathComponent(rawPath)
+        .standardizedFileURL
+        .resolvingSymlinksInPath()
+    if fileManager.fileExists(atPath: currentDirectoryCandidate.path) {
+        return currentDirectoryCandidate
+    }
+
+    if let resolved = resolveExecutable(rawPath) {
         return resolved
     }
 
